@@ -14,6 +14,7 @@ import PredictionCard    from '../components/PredictionCard.jsx'
 import SentimentGauge    from '../components/SentimentGauge.jsx'
 import TechnicalsPanel   from '../components/TechnicalsPanel.jsx'
 import RLStatsPanel      from '../components/RLStatsPanel.jsx'
+import DeephavenSyncPanel from '../components/DeephavenSyncPanel.jsx'
 
 export default function StockDetail() {
   const { ticker }  = useParams()
@@ -160,6 +161,9 @@ export default function StockDetail() {
               confidence: prediction?.probability,
             }} />
           )}
+
+          {/* Deephaven Tick-by-Tick & Alternative Sentiment Synchronization */}
+          <DeephavenSyncPanel ticker={TICKER} />
         </div>
 
         {/* Right column (1/3) */}
