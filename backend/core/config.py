@@ -31,6 +31,33 @@ class Settings(BaseSettings):
     newsapi_key: str = ""
     gnews_api_key: str = ""
     alphavantage_key: str = ""
+    benzinga_api_key: str = ""
+    sec_edgar_enabled: bool = True
+    pr_newswire_enabled: bool = True
+
+    # ── Alternative & Social Data Feeds ───────────
+    twitter_bearer_token: str = ""
+    santiment_api_key: str = ""
+    stocktwits_enabled: bool = True
+    reddit_client_id: str = ""
+    reddit_client_secret: str = ""
+    google_trends_enabled: bool = True
+    unusual_whales_api_key: str = ""
+    political_tracker_enabled: bool = True
+
+    # ── FinBERT NLP Pipeline ──────────────────────
+    finbert_model_name: str = "ProsusAI/finbert"
+    finbert_device: str = "cpu"
+    finbert_batch_size: int = 16
+    finbert_max_length: int = 512
+
+    # ── Deephaven & Streaming Engine ──────────────
+    deephaven_mode: Literal["embedded", "remote", "standalone"] = "standalone"
+    deephaven_host: str = "localhost"
+    deephaven_port: int = 10000
+    parquet_storage_dir: Path = BASE_DIR / "data" / "parquet_ticks"
+    message_broker: Literal["memory", "redis", "zmq"] = "memory"
+    redis_url: str = "redis://localhost:6379/0"
 
     # ── Stock Data ────────────────────────────────
     yahoo_finance_enabled: bool = True
@@ -79,6 +106,7 @@ class Settings(BaseSettings):
             self.faiss_index_dir,
             self.ml_model_dir,
             self.rl_feedback_log.parent,
+            self.parquet_storage_dir,
         ]
         for d in dirs:
             d.mkdir(parents=True, exist_ok=True)

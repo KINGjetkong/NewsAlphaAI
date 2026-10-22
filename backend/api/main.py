@@ -5,7 +5,7 @@ FastAPI application with REST endpoints + WebSocket for real-time pipeline strea
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,6 +21,15 @@ from backend.tools.stock_tools import (
     compute_technical_features,
     fetch_stock_ohlcv,
 )
+from backend.streaming.event_schema import MarketTick, UnifiedEvent
+from backend.streaming.deephaven_engine import get_deephaven_engine
+from backend.streaming.cross_modal_linker import get_cross_modal_linker
+from backend.streaming.event_broker import get_event_broker
+from backend.ml.regime_model import HiddenMarkovRegimeChecker
+from backend.tools.news_tools import AsyncNewsEngine
+from backend.tools.trends_tools import GoogleTrendsTracker
+from backend.tools.social_sentiment_tools import SocialSentimentIngestionEngine
+from backend.tools.flow_political_tools import FlowAndPoliticalEngine
 
 
 app = FastAPI(
@@ -107,6 +116,96 @@ async def predict_rest(ticker: str):
     except Exception as e:
         logger.error(f"Prediction error for {ticker}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/deephaven/{ticker}/snapshot")
+async def deephaven_snapshot(ticker: str):
+    """
+    Return recent As-Of joined ticks, sentiment velocity, and cross-modal clusters.
+    """
+    ticker_sym = ticker.upper()
+    engine = get_deephaven_engine()
+    linker = get_cross_modal_linker()
+    hmm = HiddenMarkovRegimeChecker()
+
+    recent_ticks = engine.get_recent_synchronized_ticks(ticker_sym, limit=50)
+    velocity = linker.compute_sentiment_velocity(ticker_sym)
+    clusters = linker.find_cross_modal_clusters(ticker_sym)
+
+    # Compute regime snapshot
+    regime = hmm.assess_regime(
+        ticker=ticker_sym,
+        price_change_pct=0.0,
+        volatility_pct=1.5,
+        volume_ratio=1.0,
+        sentiment_velocity=velocity.sentiment_velocity,
+    )
+
+    return {
+        "ticker": ticker_sym,
+        "synchronized_ticks": [t.to_dict() for t in recent_ticks],
+        "sentiment_velocity": velocity.model_dump(),
+        "cross_modal_clusters": [c.model_dump() for c in clusters],
+        "market_regime": regime.model_dump(),
+    }
+
+
+@app.get("/api/sentiment/multi-source/{ticker}")
+async def fetch_multi_source_sentiment(ticker: str):
+    """
+    Concurrently fetch alternative data across News/SEC, Google Trends,
+    Social Sentiment, and Institutional Flow with FinBERT scoring.
+    """
+    ticker_sym = ticker.upper()
+    news_engine = AsyncNewsEngine()
+    trends_engine = GoogleTrendsTracker()
+    social_engine = SocialSentimentIngestionEngine()
+    flow_engine = FlowAndPoliticalEngine()
+
+    results = await asyncio.gather(
+        news_engine.fetch_all_events_async(ticker_sym),
+        trends_engine.fetch_trends_events(ticker_sym),
+        social_engine.fetch_all_social(ticker_sym),
+        flow_engine.fetch_all_flow_and_political(ticker_sym),
+        return_exceptions=True,
+    )
+
+    all_events: list[UnifiedEvent] = []
+    for r in results:
+        if isinstance(r, list):
+            all_events.extend(r)
+        elif isinstance(r, Exception):
+            logger.warning(f"Error fetching alternative data for {ticker_sym}: {r}")
+
+    # Ingest into Deephaven sync engine and CrossModalLinker
+    engine = get_deephaven_engine()
+    linker = get_cross_modal_linker()
+    for ev in all_events:
+        engine.ingest_unified_event(ev)
+        linker.ingest_event(ev)
+
+    velocity = linker.compute_sentiment_velocity(ticker_sym)
+    clusters = linker.find_cross_modal_clusters(ticker_sym)
+
+    return {
+        "ticker": ticker_sym,
+        "event_count": len(all_events),
+        "events": [e.to_dict() for e in all_events],
+        "sentiment_velocity": velocity.model_dump(),
+        "cross_modal_clusters": [c.model_dump() for c in clusters],
+    }
+
+
+@app.get("/api/deephaven/{ticker}/displacement")
+async def deephaven_displacement(ticker: str, event_id: str, forward_ticks: int = 50):
+    """Return post-shock tick-by-tick displacement series."""
+    engine = get_deephaven_engine()
+    series = engine.get_displacement_series(ticker.upper(), event_id, forward_ticks=forward_ticks)
+    return {
+        "ticker": ticker.upper(),
+        "event_id": event_id,
+        "displacement_series": series,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -274,6 +373,123 @@ async def ws_live_price(websocket: WebSocket, ticker: str):
         except Exception:
             pass
         logger.info(f"WS live: closed for {ticker}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  WebSocket – Deephaven Tick-by-Tick Synchronization & Alternative Data Stream
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.websocket("/ws/deephaven/{ticker}")
+async def ws_deephaven_sync(websocket: WebSocket, ticker: str):
+    """
+    Real-time streaming WebSocket synchronizing sub-second market ticks with
+    FinBERT multi-source sentiment, options flow, and Google Trends momentum.
+    """
+    await websocket.accept()
+    ticker = ticker.upper()
+    logger.info(f"WS Deephaven: connected for {ticker}")
+
+    engine = get_deephaven_engine()
+    linker = get_cross_modal_linker()
+    broker = get_event_broker()
+
+    # Send initial snapshot
+    init_ticks = [t.to_dict() for t in engine.get_recent_synchronized_ticks(ticker, limit=20)]
+    init_velocity = linker.compute_sentiment_velocity(ticker).model_dump()
+    init_clusters = [c.model_dump() for c in linker.find_cross_modal_clusters(ticker)]
+
+    await _safe_send(websocket, {
+        "type": "deephaven_init",
+        "ticker": ticker,
+        "synchronized_ticks": init_ticks,
+        "sentiment_velocity": init_velocity,
+        "cross_modal_clusters": init_clusters,
+    })
+
+    # Queue for delivering broadcast messages to this client
+    send_queue: asyncio.Queue = asyncio.Queue(maxsize=100)
+
+    def on_asof_tick(joined_tick):
+        if hasattr(joined_tick, "ticker") and joined_tick.ticker == ticker:
+            try:
+                send_queue.put_nowait({
+                    "type": "asof_tick",
+                    "data": joined_tick.to_dict(),
+                })
+            except asyncio.QueueFull:
+                pass
+
+    def on_unified_event(event):
+        if hasattr(event, "ticker") and event.ticker == ticker:
+            try:
+                send_queue.put_nowait({
+                    "type": "unified_event",
+                    "data": event.to_dict(),
+                })
+            except asyncio.QueueFull:
+                pass
+
+    broker.subscribe("asof_tick", on_asof_tick)
+    broker.subscribe("unified_event", on_unified_event)
+
+    async def client_writer():
+        while True:
+            msg = await send_queue.get()
+            ok = await _safe_send(websocket, msg)
+            if not ok:
+                break
+
+    async def client_reader():
+        while True:
+            try:
+                data = await websocket.receive_json()
+                msg_type = data.get("type")
+                if msg_type == "tick":
+                    # Ingest custom incoming market tick
+                    price = float(data.get("price", 0.0))
+                    size = float(data.get("size", 100))
+                    bid = float(data.get("bid", price - 0.01))
+                    ask = float(data.get("ask", price + 0.01))
+                    tick_obj = MarketTick(
+                        tick_id=f"tick_{datetime.now(timezone.utc).strftime('%H%M%S%f')[:10]}",
+                        timestamp=datetime.now(timezone.utc),
+                        ticker=ticker,
+                        price=price,
+                        size=size,
+                        bid=bid,
+                        ask=ask,
+                    )
+                    joined = engine.ingest_market_tick(tick_obj)
+                    await _safe_send(websocket, {
+                        "type": "asof_tick",
+                        "data": joined.to_dict(),
+                    })
+                elif msg_type == "ping":
+                    await _safe_send(websocket, {"type": "pong"})
+            except (WebSocketDisconnect, RuntimeError):
+                break
+            except Exception as e:
+                logger.warning(f"WS Deephaven read error: {e}")
+                break
+
+    writer_task = asyncio.create_task(client_writer())
+    reader_task = asyncio.create_task(client_reader())
+
+    try:
+        done, pending = await asyncio.wait(
+            [writer_task, reader_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+    finally:
+        broker.unsubscribe("asof_tick", on_asof_tick)
+        broker.unsubscribe("unified_event", on_unified_event)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+        logger.info(f"WS Deephaven: closed for {ticker}")
 
 
 if __name__ == "__main__":

@@ -21,7 +21,18 @@ async def lifespan(app: FastAPI):
     logger.info("Starting background scheduler…")
     _scheduler = create_scheduler()
     _scheduler.start()
+
+    from backend.streaming.event_broker import get_event_broker
+    from backend.streaming.deephaven_engine import get_deephaven_engine
+
+    broker = get_event_broker()
+    await broker.start()
+    get_deephaven_engine()
+    logger.info("Asynchronous event broker & Deephaven sync engine active.")
+
     yield
-    logger.info("Shutting down scheduler…")
+
+    logger.info("Shutting down event broker and scheduler…")
+    await broker.stop()
     if _scheduler and _scheduler.running:
         _scheduler.shutdown(wait=False)

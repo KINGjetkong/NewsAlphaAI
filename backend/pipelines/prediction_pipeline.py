@@ -221,6 +221,7 @@ def node_llm_reason(state: PipelineState) -> PipelineState:
 
 def node_ml_predict(state: PipelineState) -> PipelineState:
     from backend.ml.prediction_model import StockPredictor
+    from backend.ml.regime_model import HiddenMarkovRegimeChecker
 
     ticker = state["ticker"]
     tech = state.get("tech_features", {})
@@ -229,15 +230,32 @@ def node_ml_predict(state: PipelineState) -> PipelineState:
 
     feature_vec = StockPredictor.build_feature_vector(tech, batch, analysed)
     predictor = StockPredictor(ticker)
-    ml_pred = predictor.predict(feature_vec)
+
+    # Hidden Markov Model daily regime check
+    hmm = HiddenMarkovRegimeChecker()
+    regime = hmm.assess_regime(
+        ticker=ticker,
+        price_change_pct=tech.get("change_1d_pct", 0.0),
+        volatility_pct=tech.get("atr_pct", 1.5),
+        volume_ratio=tech.get("vol_ratio", 1.0),
+        sentiment_velocity=batch.get("sentiment_score", 0.0),
+    )
+
+    ml_pred = predictor.predict_with_regime(
+        feature_vec, tilt_multiplier=regime.tilt_multiplier
+    )
 
     return {
         **state,
         "ml_prediction": {
             **ml_pred,
             "feature_vec": feature_vec.flatten().tolist(),
+            "regime": regime.model_dump(),
         },
-        "logs": [f"ML prediction: {ml_pred['direction']} ({ml_pred['probability']:.1%})"],
+        "logs": [
+            f"ML prediction: {ml_pred['direction']} ({ml_pred['probability']:.1%}) "
+            f"[Regime: {regime.regime.value}, Tilt: {regime.tilt_multiplier:+.2f}]"
+        ],
     }
 
 

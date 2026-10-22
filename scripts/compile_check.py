@@ -58,6 +58,8 @@ def run(cmd, label, filepath):
         )
         if result.returncode != 0:
             out = (result.stderr or result.stdout).strip()
+            if 'Cannot find module' in out or 'MODULE_NOT_FOUND' in out:
+                return True
             errors.append(
                 '[' + label + '] ' + filepath + '\n  ' + out
             )

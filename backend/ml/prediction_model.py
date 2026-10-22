@@ -112,6 +112,37 @@ class StockPredictor:
             logger.warning(f"Prediction model error, using heuristic: {e}")
             return self._heuristic_predict(feature_vec)
 
+    def predict_with_regime(
+        self, feature_vec: np.ndarray, tilt_multiplier: float = 0.0
+    ) -> dict:
+        """
+        Adjust prediction probability using Hidden Markov Model tilt multiplier.
+        Tilt shifts log-odds before calibration.
+        """
+        base = self.predict(feature_vec)
+        p_up = base["probability"] if base["direction"] == "UP" else (1.0 - base["probability"])
+
+        # Shift log-odds by tilt
+        eps = 1e-4
+        p_bounded = max(eps, min(1.0 - eps, p_up))
+        logit = np.log(p_bounded / (1.0 - p_bounded))
+        tilted_logit = logit + (tilt_multiplier * 0.6)
+        tilted_p_up = float(1.0 / (1.0 + np.exp(-tilted_logit)))
+
+        new_dir = "UP" if tilted_p_up >= 0.5 else "DOWN"
+        new_prob = float(max(tilted_p_up, 1.0 - tilted_p_up))
+        conf = "HIGH" if new_prob > 0.7 else ("MEDIUM" if new_prob > 0.55 else "LOW")
+
+        return {
+            **base,
+            "direction": new_dir,
+            "probability": round(new_prob, 4),
+            "confidence_band": conf,
+            "tilt_applied": round(tilt_multiplier, 3),
+            "uncalibrated_up_prob": round(p_up, 4),
+            "calibrated_up_prob": round(tilted_p_up, 4),
+        }
+
     def _heuristic_predict(self, vec: np.ndarray) -> dict:
         """Rule-based fallback when model lacks training data."""
         v = vec.flatten()
